@@ -7,79 +7,135 @@ import pandas as pd
 import re
 import time
 import threading
+import sys 
+import os
+import urllib3
 
-# ---- CONFIG ----
-API_KEY = # SUA_API_KEY_AQUI  # <--- coloque sua SerpApi key aqui
 
+def resource_path(relative_path):
+    """Retorna o caminho absoluto, mesmo dentro do .exe"""
+    try:
+        base_path = sys._MEIPASS  # usado quando empacotado
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+
+# 🔑 SUA CHAVE SERPAPI AQUI
+API_KEY = "SUA_API_KEY_AQUI"
+
+# Desativa alertas SSL de sites com certificados problemáticos
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Dicionário de cidades e bairros
 locais = {
     "São Paulo": ["Moema", "Pinheiros", "Tatuapé", "Santana", "Morumbi"],
     "Rio de Janeiro": ["Copacabana", "Barra da Tijuca", "Botafogo", "Tijuca", "Ipanema"],
     "Curitiba": ["Centro", "Água Verde", "Batel"],
     "Belo Horizonte": ["Savassi", "Funcionários", "Buritis"]
 }
-# ----------------
 
-def worker_busca(cidade, bairro, on_done_callback):
-    """Função que roda em thread separada — faz todo o trabalho de scraping."""
+# Caminho do arquivo Excel geral (onde ficam todos os resultados)
+ARQUIVO_GERAL = "condominios_coletados.xlsx"
+
+# Lê dados já coletados (para evitar repetição)
+def carregar_existentes():
+    if os.path.exists(ARQUIVO_GERAL):
+        df = pd.read_excel(ARQUIVO_GERAL)
+        return set(df["Site"].tolist())
+    return set()
+
+# Salva novos resultados sem duplicar
+def salvar_dados_novos(dados):
+    novos_df = pd.DataFrame(dados)
+    if os.path.exists(ARQUIVO_GERAL):
+        antigo_df = pd.read_excel(ARQUIVO_GERAL)
+        combinado_df = pd.concat([antigo_df, novos_df], ignore_index=True).drop_duplicates(subset=["Site"])
+        combinado_df.to_excel(ARQUIVO_GERAL, index=False)
+    else:
+        novos_df.to_excel(ARQUIVO_GERAL, index=False)
+
+# --- LÓGICA DE BUSCA (executada em thread separada) ---
+def worker_busca(cidade, bairro, on_done_callback, on_progress_callback):
     dados = []
-    try:
-        query = f"lista de condomínios residenciais em {bairro}, {cidade}"
-        params = {
-            "engine": "google",
-            "q": query,
-            "google_domain": "google.com.br",
-            "hl": "pt-BR",
-            "num": "10",
-            "api_key": API_KEY
-        }
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        links = [r["link"] for r in results.get("organic_results", []) if "link" in r]
+    sites_existentes = carregar_existentes()
 
-        for link in links:
+    consultas = [
+        f"lista de condomínios em {bairro}, {cidade}",
+        f"condomínios residenciais em {bairro}, {cidade}",
+        f"prédios e condomínios em {bairro}, {cidade}"
+    ]
+
+    todos_links = []
+
+    # Coleta todos os links primeiro
+    for consulta in consultas:
+        for start in [0, 10, 20]:
+            params = {
+                "engine": "google",
+                "q": consulta,
+                "google_domain": "google.com.br",
+                "hl": "pt-BR",
+                "num": "10",
+                "start": start,
+                "api_key": API_KEY
+            }
             try:
-                resposta = requests.get(link, timeout=10)
-                sopa = BeautifulSoup(resposta.text, "html.parser")
-                texto = sopa.get_text().lower()
-
-                if "condomínio" in texto or "condominio" in texto:
-                    nome = sopa.title.string.strip() if sopa.title else "Não informado"
-                    telefone = re.search(r"\(?\d{2}\)?\s?\d{4,5}-\d{4}", texto)
-                    email = re.search(r"[\w\.-]+@[\w\.-]+", texto)
-                    endereco = re.search(r"(rua|avenida|av\.|estrada|praça)\s[^\n]{10,60}", texto)
-
-                    dados.append({
-                        "Cidade": cidade,
-                        "Bairro": bairro,
-                        "Site": link,
-                        "Nome Condomínio": nome,
-                        "Telefone": telefone.group(0) if telefone else "Não encontrado",
-                        "Contato": email.group(0) if email else "Não encontrado",
-                        "Endereço": endereco.group(0).capitalize() if endereco else "Não encontrado"
-                    })
-                time.sleep(1.0)  # pausa curta para ser gentil com servidores
+                search = GoogleSearch(params)
+                results = search.get_dict()
+                links = [r["link"] for r in results.get("organic_results", []) if "link" in r]
+                todos_links.extend(links)
             except Exception as e:
-                print(f"Erro ao acessar {link}: {e}")
-    except Exception as e:
-        print(f"Erro na busca SerpApi: {e}")
+                print(f"Erro ao buscar links: {e}")
 
-    # chama o callback na thread principal (GUI)
+    todos_links = list(set(todos_links))  # remove duplicados
+    total_links = len(todos_links)
+    print(f"Total de links para processar: {total_links}")
+
+    for i, link in enumerate(todos_links, start=1):
+        try:
+            if link in sites_existentes:
+                on_progress_callback(i, total_links)
+                continue
+
+            resposta = requests.get(link, timeout=10, verify=False)
+            sopa = BeautifulSoup(resposta.text, "html.parser")
+            texto = sopa.get_text().lower()
+
+            if "condomínio" in texto or "condominio" in texto:
+                nome = sopa.title.string.strip() if sopa.title else "Não informado"
+                telefone = re.search(r"\(?\d{2}\)?\s?\d{4,5}-\d{4}", texto)
+                email = re.search(r"[\w\.-]+@[\w\.-]+", texto)
+                endereco = re.search(r"(rua|avenida|av\.|estrada|praça)\s[^\n]{10,60}", texto)
+
+                dados.append({
+                    "Cidade": cidade,
+                    "Bairro": bairro,
+                    "Site": link,
+                    "Nome Condomínio": nome,
+                    "Telefone": telefone.group(0) if telefone else "Não encontrado",
+                    "Contato": email.group(0) if email else "Não encontrado",
+                    "Endereço": endereco.group(0).capitalize() if endereco else "Não encontrado"
+                })
+            time.sleep(1)
+        except Exception as e:
+            print(f"Erro ao acessar {link}: {e}")
+        finally:
+            on_progress_callback(i, total_links)  # atualiza progresso visual
+
     on_done_callback(dados)
 
+
+# --- CALLBACKS DA INTERFACE ---
 def on_search_done(dados):
-    """Executado na thread principal quando worker terminar."""
-    # para a barra de progresso e habilita botão
     progress.stop()
     btn_buscar.config(state="normal")
 
     if dados:
-        nome_arquivo = f"condominios_{combo_cidade.get()}_{combo_bairro.get()}.xlsx".replace(" ", "_")
-        df = pd.DataFrame(dados)
-        df.to_excel(nome_arquivo, index=False)
-        messagebox.showinfo("Concluído", f"✅ Planilha criada: {nome_arquivo}")
-        pd.read_excel(nome_arquivo)
+        salvar_dados_novos(dados)
+        messagebox.showinfo("Concluído", f"✅ {len(dados)} novos condomínios adicionados!")
     else:
-        messagebox.showinfo("Resultado", "⚠️ Nenhum dado encontrado para essa busca.")
+        messagebox.showinfo("Resultado", "⚠️ Nenhum novo condomínio encontrado.")
 
 def buscar_condominios():
     cidade = combo_cidade.get()
@@ -88,11 +144,9 @@ def buscar_condominios():
         messagebox.showwarning("Aviso", "Selecione uma cidade e um bairro!")
         return
 
-    # desabilita botão e inicia barra de progresso
     btn_buscar.config(state="disabled")
-    progress.start(10)  # 10ms entre "frames" da animação
+    progress.start(10)
 
-    # Inicia thread que fará o scraping e depois chamará on_search_done
     thread = threading.Thread(
         target=worker_busca,
         args=(cidade, bairro, lambda dados: root.after(0, on_search_done, dados)),
@@ -100,10 +154,10 @@ def buscar_condominios():
     )
     thread.start()
 
-# --- Cria a janela PRINCIPAL antes de criar qualquer widget ---
+# --- INTERFACE GRÁFICA ---
 root = tk.Tk()
 root.title("Busca de Condomínios 🏙️")
-root.geometry("480x320")
+root.geometry("480x330")
 root.resizable(False, False)
 
 style = ttk.Style()
@@ -128,7 +182,6 @@ def atualizar_bairros(event):
 
 combo_cidade.bind("<<ComboboxSelected>>", atualizar_bairros)
 
-# Barra de progresso (definida após root existir)
 progress = ttk.Progressbar(root, mode='indeterminate', length=360)
 progress.pack(pady=(18, 6))
 
